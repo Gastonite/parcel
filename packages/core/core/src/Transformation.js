@@ -10,7 +10,8 @@ import type {
 } from '@parcel/types';
 import type {
   Asset as AssetValue,
-  AssetRequest,
+  AssetRequestDesc,
+  AssetRequestResult,
   Config,
   NodeId,
   ConfigRequest,
@@ -40,17 +41,17 @@ type PostProcessFunc = (
 ) => Promise<Array<InternalAsset> | null>;
 
 export type TransformationOpts = {|
-  request: AssetRequest,
+  request: AssetRequestDesc,
   loadConfig: (ConfigRequest, NodeId) => Promise<Config>,
   parentNodeId: NodeId,
   options: ParcelOptions,
-  workerApi: WorkerApi
+  workerApi: WorkerApi // ? Does this need to be here?
 |};
 
 type ConfigMap = Map<PackageName, Config>;
 
 export default class Transformation {
-  request: AssetRequest;
+  request: AssetRequestDesc;
   configRequests: Array<ConfigRequest>;
   loadConfig: ConfigRequest => Promise<Config>;
   options: ParcelOptions;
@@ -78,11 +79,7 @@ export default class Transformation {
     this.impactfulOptions = {minify, hot, scopeHoist};
   }
 
-  async run(): Promise<{
-    assets: Array<AssetValue>,
-    configRequests: Array<ConfigRequest>,
-    ...
-  }> {
+  async run(): Promise<AssetRequestResult> {
     report({
       type: 'buildProgress',
       phase: 'transforming',

@@ -1,30 +1,17 @@
 // @flow strict-local
 
-import type {FilePath, Glob} from '@parcel/types';
+import type {FilePath, Glob, JSONObject} from '@parcel/types';
 import type {Event} from '@parcel/watcher';
 import type {Config, ParcelOptions, Target} from './types';
-
-import invariant from 'assert';
-import nullthrows from 'nullthrows';
-import path from 'path';
-
-import {PromiseQueue, md5FromObject, isGlob, isGlobMatch} from '@parcel/utils';
-import WorkerFarm from '@parcel/workers';
-
-import {addDevDependency} from './InternalConfig';
-import ConfigLoader from './ConfigLoader';
-import type {Dependency} from './types';
-import Graph, {type GraphOpts} from './Graph';
-import type ParcelConfig from './ParcelConfig';
-import ResolverRunner from './ResolverRunner';
-import {EntryResolver} from './EntryResolver';
-import TargetResolver from './TargetResolver';
+import type {AbortSignal} from 'abortcontroller-polyfill/dist/cjs-ponyfill';
 import type {
   Asset as AssetValue,
-  AssetRequest,
+  AssetRequestDesc,
+  AssetRequestResult,
   AssetRequestNode,
   ConfigRequest,
   ConfigRequestNode,
+  Dependency,
   DepPathRequestNode,
   DepVersionRequestNode,
   EntryRequestNode,
@@ -36,6 +23,24 @@ import type {
   TransformationOpts,
   ValidationOpts
 } from './types';
+
+import invariant from 'assert';
+import nullthrows from 'nullthrows';
+import path from 'path';
+
+import {PromiseQueue, md5FromObject, isGlob, isGlobMatch} from '@parcel/utils';
+import WorkerFarm from '@parcel/workers';
+
+import {addDevDependency} from './InternalConfig';
+import ConfigLoader from './ConfigLoader';
+import Graph, {type GraphOpts} from './Graph';
+import type ParcelConfig from './ParcelConfig';
+import ResolverRunner from './ResolverRunner';
+import {EntryResolver} from './EntryResolver';
+import type {EntryResult} from './EntryResolver'; // ? Is this right
+import TargetResolver from './TargetResolver';
+import type {TargetResolveResult} from './TargetResolver';
+import {assertSignalNotAborted} from './utils';
 
 type RequestGraphOpts = {|
   ...GraphOpts<RequestGraphNode>,
@@ -89,27 +94,17 @@ const nodeFromGlob = (glob: Glob) => ({
   value: glob
 });
 
-const nodeFromEntryRequest = (entry: string) => ({
-  id: 'entry_request:' + entry,
-  type: 'entry_request',
-  value: entry
-});
-
-const nodeFromTargetRequest = (entry: FilePath) => ({
-  id: 'target_request:' + entry,
-  type: 'target_request',
-  value: entry
+const nodeFromRequest = (request: Request) => ({
+  id: request.id,
+  type: request.type,
+  value: request
 });
 
 export default class RequestGraph extends Graph<RequestGraphNode> {
   // $FlowFixMe
   inProgress: Map<NodeId, Promise<any>> = new Map();
   invalidNodeIds: Set<NodeId> = new Set();
-  runTransform: TransformationOpts => Promise<{
-    assets: Array<AssetValue>,
-    configRequests: Array<ConfigRequest>,
-    ...
-  }>;
+  runTransform: TransformationOpts => Promise<AssetRequestResult>;
   runValidate: ValidationOpts => Promise<void>;
   loadConfigHandle: () => Promise<Config>;
   entryResolver: EntryResolver;
@@ -130,6 +125,7 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
   // filesystem changes alone. They should rerun on each startup of Parcel.
   unpredicatableNodeIds: Set<NodeId> = new Set();
   depVersionRequestNodeIds: Set<NodeId> = new Set();
+  signal: ?AbortSignal;
 
   // $FlowFixMe
   static deserialize(opts: SerializedRequestGraph) {
@@ -193,7 +189,9 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
     await this.validationQueue.run();
   }
 
-  async completeRequests() {
+  async completeRequests(signal?: AbortSignal) {
+    this.signal = signal;
+
     for (let id of this.invalidNodeIds) {
       let node = nullthrows(this.getNode(id));
       this.processNode(node);
@@ -228,18 +226,27 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
     return super.removeNode(node);
   }
 
-  addEntryRequest(entry: string) {
-    let requestNode = nodeFromEntryRequest(entry);
+  addRequestNode(request: Request) {
+    let requestNode = nodeFromRequest(request);
     if (!this.hasNode(requestNode.id)) {
       this.addNode(requestNode);
     }
   }
 
+  addEntryRequest(entry: string) {
+    let request = new EntryRequest({
+      request: entry,
+      entryResolver: this.entryResolver
+    });
+    this.addRequestNode(request);
+  }
+
   addTargetRequest(entry: FilePath) {
-    let requestNode = nodeFromTargetRequest(entry);
-    if (!this.hasNode(requestNode.id)) {
-      this.addNode(requestNode);
-    }
+    let request = new TargetRequest({
+      request: entry,
+      targetResolver: this.targetResolver
+    });
+    this.addRequestNode(request);
   }
 
   addDepPathRequest(dep: Dependency) {
@@ -250,12 +257,42 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
   }
 
   addAssetRequest(id: NodeId, request: AssetRequest) {
+    let request = new AssetRequest({
+      request
+    });
     let requestNode = {id, type: 'asset_request', value: request};
     if (!this.hasNode(requestNode.id)) {
       this.addNode(requestNode);
     }
 
     this.connectFile(requestNode, request.filePath);
+  }
+
+  async processNode2(requestNode) {
+    let signal = this.signal; // ? is this safe?
+    let promise = this.queue.add(async () => {
+      let result = await requestNode.value.run();
+      assertSignalNotAborted(signal);
+      if (!this.hasNode(requestNode)) {
+        return;
+      }
+      requestNode.value.addResultToGraph(result, this);
+    });
+
+    if (promise) {
+      try {
+        this.inProgress.set(requestNode.id, promise);
+        await promise;
+        // ? Should these be updated before it comes off the queue?
+        this.invalidNodeIds.delete(requestNode.id);
+      } catch (e) {
+        // Do nothing
+        // Main tasks will be caught by the queue
+        // Sub tasks will end up rejecting the main task promise
+      } finally {
+        this.inProgress.delete(requestNode.id);
+      }
+    }
   }
 
   async processNode(requestNode: RequestGraphNode) {
@@ -321,77 +358,6 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
       parentNodeId: requestNode.id,
       options: this.options
     });
-  }
-
-  async transform(requestNode: AssetRequestNode) {
-    try {
-      let start = Date.now();
-      let request = requestNode.value;
-      let {assets, configRequests} = await this.runTransform({
-        request,
-        loadConfig: this.loadConfigHandle,
-        parentNodeId: requestNode.id,
-        options: this.options
-      });
-
-      let time = Date.now() - start;
-      for (let asset of assets) {
-        asset.stats.time = time;
-      }
-
-      // Ignore in case the request was deleted while transforming
-      if (!this.hasNode(requestNode.id)) {
-        return;
-      }
-
-      let configRequestNodes = configRequests.map(configRequest => {
-        let node = nodeFromConfigRequest(configRequest);
-        return this.getNode(node.id) || node;
-      });
-      this.replaceNodesConnectedTo(
-        requestNode,
-        configRequestNodes,
-        node => node.type === 'config_request'
-      );
-
-      this.onAssetRequestComplete(requestNode, assets);
-      return assets;
-    } catch (e) {
-      // TODO: add includedFiles even if it failed so we can try a rebuild if those files change
-      throw e;
-    }
-  }
-
-  async resolveEntry(entryRequestNode: EntryRequestNode) {
-    let result = await this.entryResolver.resolveEntry(entryRequestNode.value);
-
-    // Connect files like package.json that affect the entry
-    // resolution so we invalidate when they change.
-    for (let file of result.files) {
-      this.connectFile(entryRequestNode, file.filePath);
-    }
-
-    // If the entry specifier is a glob, add a glob node so
-    // we invalidate when a new file matches.
-    if (isGlob(entryRequestNode.value)) {
-      this.connectGlob(entryRequestNode, entryRequestNode.value);
-    }
-
-    this.onEntryRequestComplete(entryRequestNode.value, result.entries);
-  }
-
-  async resolveTargetRequest(targetRequestNode: TargetRequestNode) {
-    let result = await this.targetResolver.resolve(
-      path.dirname(targetRequestNode.value)
-    );
-
-    // Connect files like package.json that affect the target
-    // resolution so we invalidate when they change.
-    for (let file of result.files) {
-      this.connectFile(targetRequestNode, file.filePath);
-    }
-
-    this.onTargetRequestComplete(targetRequestNode.value, result.targets);
   }
 
   async resolvePath(dep: Dependency) {
@@ -667,5 +633,183 @@ export default class RequestGraph extends Graph<RequestGraphNode> {
     }
 
     return isInvalid;
+  }
+}
+
+class Request<TRequestDesc: JSONObject | string, TResult> {
+  id: string;
+  type: string;
+  request: TRequestDesc;
+  runFn: TRequestDesc => Promise<TResult>;
+  storeResult: boolean;
+  result: ?TResult;
+  promise: ?Promise<TResult>;
+
+  constructor({
+    type,
+    request,
+    runFn,
+    storeResult
+  }: {|
+    type: string,
+    request: TRequestDesc,
+    runFn: TRequestDesc => Promise<TResult>,
+    storeResult?: boolean
+  |}) {
+    this.id = typeof request === 'string' ? request : md5FromObject(request);
+    this.type = type;
+    this.request = request;
+    this.runFn = runFn;
+    this.storeResult = storeResult || true;
+  }
+
+  async run(): Promise<TResult> {
+    this.result = null;
+    this.promise = this.runFn(this.request);
+    let result = await this.promise;
+    if (this.storeResult) {
+      this.result = result;
+    }
+    this.promise = null;
+
+    return result;
+  }
+
+  // vars need to be defined for flow
+  addResultToGraph(
+    requestNode: RequestNode, // eslint-disable-line no-unused-vars
+    result: TResult, // eslint-disable-line no-unused-vars
+    graph: RequestGraph // eslint-disable-line no-unused-vars
+  ) {
+    throw new Error('Request Subclass did not override `addResultToGraph`');
+  }
+}
+
+class EntryRequest extends Request<FilePath, EntryResult> {
+  constructor({
+    request,
+    entryResolver
+  }: {|
+    request: FilePath,
+    entryResolver: EntryResolver
+  |}) {
+    super({
+      type: 'entry_request',
+      request,
+      runFn: () => entryResolver.resolveEntry(request),
+      storeResult: false
+    });
+  }
+
+  addResultToGraph(
+    requestNode: EntryRequestNode,
+    result: EntryResult,
+    graph: RequestGraph
+  ) {
+    // Connect files like package.json that affect the entry
+    // resolution so we invalidate when they change.
+    for (let file of result.files) {
+      graph.connectFile(requestNode, file.filePath);
+    }
+
+    // If the entry specifier is a glob, add a glob node so
+    // we invalidate when a new file matches.
+    if (isGlob(requestNode.value)) {
+      graph.connectGlob(requestNode, requestNode.value);
+    }
+
+    //this.onEntryRequestComplete(entryRequestNode.value, result.entries);
+  }
+}
+
+class TargetRequest extends Request<FilePath, TargetResolveResult> {
+  constructor({
+    request,
+    targetResolver
+  }: {|
+    request: FilePath,
+    targetResolver: TargetResolver
+  |}) {
+    super({
+      type: 'target_request',
+      request,
+      runFn: () => targetResolver.resolve(path.dirname(request)),
+      storeResult: false
+    });
+  }
+
+  addResultToGraph(
+    requestNode: TargetRequestNode,
+    result: TargetResolveResult,
+    graph: RequestGraph
+  ) {
+    // Connect files like package.json that affect the target
+    // resolution so we invalidate when they change.
+    for (let file of result.files) {
+      this.connectFile(targetRequestNode, file.filePath);
+    }
+
+    //this.onTargetRequestComplete(targetRequestNode.value, result.targets);
+  }
+}
+
+class AssetRequest extends Request<AssetRequestDesc, AssetRequestResult> {
+  constructor({
+    request,
+    runTransform,
+    loadConfig,
+    parentNodeId,
+    options
+  }: {|
+    request: AssetRequestDesc,
+    // TODO: get shared flow type
+    runTransform: ({|
+      request: AssetRequestDesc,
+      loadConfig: (ConfigRequest, NodeId) => Promise<Config>,
+      parentNodeId: NodeId,
+      options: ParcelOptions,
+      workerApi: WorkerApi // ? Does this need to be here?
+    |}) => Promise<AssetRequestResult>,
+    loadConfig: any, //TODO
+    parentNodeId: NodeId,
+    options: ParcelOptions
+  |}) {
+    super({
+      type: 'asset_request',
+      request,
+      runFn: async () => {
+        let start = Date.now();
+        let {assets, configRequests} = await runTransform({
+          request,
+          loadConfig,
+          parentNodeId: this.id, // ? Will this be the right value
+          options
+        });
+
+        let time = Date.now() - start;
+        for (let asset of assets) {
+          asset.stats.time = time;
+        }
+        return {assets, configRequests};
+      }
+    });
+  }
+
+  addResultToGraph(requestNode, result, graph) {
+    let {assets, configRequests} = result;
+    let configRequestNodes = configRequests.map(configRequest => {
+      let node = nodeFromConfigRequest(configRequest);
+      return graph.getNode(node.id) || node;
+    });
+    graph.replaceNodesConnectedTo(
+      requestNode,
+      configRequestNodes,
+      node => node.type === 'config_request'
+    );
+
+    //this.onAssetRequestComplete(requestNode, assets);
+    return assets;
+
+    // TODO: add includedFiles even if it failed so we can try a rebuild if those files change
   }
 }

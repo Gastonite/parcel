@@ -12,6 +12,7 @@ import type {
   ParcelOptions,
   Target
 } from './types';
+import type {AbortSignal} from 'abortcontroller-polyfill/dist/cjs-ponyfill';
 
 import EventEmitter from 'events';
 import {md5FromObject, md5FromString} from '@parcel/utils';
@@ -88,11 +89,13 @@ export default class AssetGraphBuilder extends EventEmitter {
     }
   }
 
-  async build(): Promise<{|
+  async build(
+    signal?: AbortSignal
+  ): Promise<{|
     assetGraph: AssetGraph,
     changedAssets: Map<string, Asset>
   |}> {
-    await this.requestGraph.completeRequests();
+    await this.requestGraph.completeRequests(signal);
 
     dumpToGraphViz(this.assetGraph, 'AssetGraph');
     dumpToGraphViz(this.requestGraph, 'RequestGraph');

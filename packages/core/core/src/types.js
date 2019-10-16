@@ -142,15 +142,19 @@ export type FileNode = {|id: string, +type: 'file', value: File|};
 export type GlobNode = {|id: string, +type: 'glob', value: Glob|};
 export type RootNode = {|id: string, +type: 'root', value: string | null|};
 
-export type AssetRequest = {|
+export type AssetRequestDesc = {|
   filePath: FilePath,
   env: Environment,
   sideEffects?: boolean,
   code?: string
 |};
 
+export type AssetRequestResult = {|
+  assets: Array<Asset>,
+  configRequests: Array<ConfigRequest>
+|};
 // Asset group nodes are essentially used as placeholders for the results of an asset request
-export type AssetGroup = AssetRequest;
+export type AssetGroup = AssetRequestDesc;
 export type AssetGroupNode = {|
   id: string,
   +type: 'asset_group',
