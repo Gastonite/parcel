@@ -171,6 +171,13 @@ class Resolver {
 
       return {filePath: builtins[filename]};
     }
+    
+    try {
+      dir = await fs.realpath(dir);
+    } catch (err) {
+      // ignore
+    }
+
 
     let parts = getModuleParts(filename);
     let root = path.parse(dir).root;
